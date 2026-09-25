@@ -12,7 +12,35 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Sync fork
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream, keep local workflow files untouched
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh repo sync ${{ github.repository }} --branch main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Find upstream repo automatically (works for any fork)
+          UPSTREAM=$(gh repo view --json parent -q '.parent.owner.login + "/" + .parent.name')
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git fetch upstream
+
+          # Snapshot current workflow files
+          mkdir -p /tmp/workflows-backup
+          [ -d .github/workflows ] && cp -r .github/workflows/. /tmp/workflows-backup/ || true
+
+          # Merge upstream into main
+          git merge upstream/main --no-edit
+
+          # Restore fork's own workflow files so the push never touches them
+          mkdir -p .github/workflows
+          rm -rf .github/workflows/*
+          cp -r /tmp/workflows-backup/. .github/workflows/ 2>/dev/null || true
+
+          git add -A
+          git diff --cached --quiet || git commit -m "Sync with upstream (workflow files preserved)"
+          git push origin main
