@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -15,32 +19,57 @@ jobs:
       - name: Checkout fork
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
 
-      - name: Merge upstream, keep local workflow files untouched
+      - name: Merge upstream, preserve fork workflows
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Find upstream repo automatically (works for any fork)
-          UPSTREAM=$(gh repo view --json parent -q '.parent.owner.login + "/" + .parent.name')
-          git remote add upstream "https://github.com/${UPSTREAM}.git"
-          git fetch upstream
+          UPSTREAM=$(gh repo view "$GITHUB_REPOSITORY" --json parent \
+            -q '.parent.owner.login + "/" + .parent.name')
+          git fetch "https://github.com/${UPSTREAM}.git" main
+          upstream_commit=$(git rev-parse FETCH_HEAD)
 
-          # Snapshot current workflow files
-          mkdir -p /tmp/workflows-backup
-          [ -d .github/workflows ] && cp -r .github/workflows/. /tmp/workflows-backup/ || true
+          backup=$(mktemp -d "${RUNNER_TEMP}/equicord-workflows.XXXXXX")
+          trap 'rm -rf "$backup"' EXIT
+          cp -a .github/workflows/. "$backup/"
 
-          # Merge upstream into main
-          git merge upstream/main --no-edit
+          if git merge --no-commit --no-ff "$upstream_commit"; then
+            merge_status=0
+          else
+            merge_status=$?
+          fi
 
-          # Restore fork's own workflow files so the push never touches them
+          rm -rf .github/workflows
           mkdir -p .github/workflows
-          rm -rf .github/workflows/*
-          cp -r /tmp/workflows-backup/. .github/workflows/ 2>/dev/null || true
+          cp -a "$backup/." .github/workflows/
+          git add -A -- .github/workflows
 
-          git add -A
-          git diff --cached --quiet || git commit -m "Sync with upstream (workflow files preserved)"
-          git push origin main
+          conflicts=$(git diff --name-only --diff-filter=U)
+          if [[ -n "$conflicts" ]]; then
+            printf 'Unresolved conflicts outside workflows:\n%s\n' "$conflicts"
+            git merge --abort
+            exit 1
+          fi
+
+          if [[ "$merge_status" -ne 0 ]] && ! git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+            printf 'Merge failed without a recoverable merge state.\n'
+            exit "$merge_status"
+          fi
+
+          git diff --cached --exit-code -- .github/workflows
+
+          if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+            git commit -m "Sync with upstream (fork workflows preserved)"
+          elif ! git diff --cached --quiet; then
+            git commit -m "Preserve fork workflow files"
+          fi
+
+          git push origin HEAD:main
